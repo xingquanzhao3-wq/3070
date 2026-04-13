@@ -1,0 +1,82 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// WiFi 账号密码
+const char* ssid = "G08GR";
+const char* password = "33338888";
+
+// Render 服务器地址
+const char* serverUrl = "https://evergreen-box-backend.onrender.com/api/sensor/upload";
+
+// 定义与 Mega 通信的串口 (使用 UART1)
+// RX 针脚接 Mega 的 TX1(18)，TX 针脚接 Mega 的 RX1(19)
+#define MEGA_RX_PIN 20
+#define MEGA_TX_PIN 21
+HardwareSerial megaSerial(1); 
+
+void setup() {
+  Serial.begin(9600); // 用于连接电脑，查看 WiFi 状态和服务器返回信息
+  
+  // 初始化与 Mega 通信的串口
+  megaSerial.begin(9600, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
+  
+  // 连接 WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("正在连接 WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi 已连接！");
+}
+
+void loop() {
+  // 检查 Mega 是否发来了数据
+  
+  if (megaSerial.available()) {
+    // 读取一整行数据（直到遇到换行符）
+    String receivedData = megaSerial.readStringUntil('\n');
+    receivedData.trim(); // 去除多余的空格或回车符
+
+    // 简单验证：如果数据是以 "{" 开头，说明是 JSON 数据
+    if (receivedData.startsWith("{")) {
+      Serial.println("\n收到 Mega 数据: " + receivedData);
+      
+      // 执行上传
+      if (WiFi.status() == WL_CONNECTED) {
+        sendToRender(receivedData);
+      } else {
+        Serial.println("WiFi 断开，无法上传");
+      }
+    }
+  }
+}
+
+// 发送 HTTPS POST 请求的函数
+void sendToRender(String jsonPayload) {
+  WiFiClientSecure client;
+  client.setInsecure(); // 绕过 SSL 证书校验，适合测试环境
+
+  HTTPClient http;
+  
+  Serial.println("正在连接 Render 服务器...");
+  if (http.begin(client, serverUrl)) {
+    http.addHeader("Content-Type", "application/json");
+
+    // 发送数据并获取服务器状态码
+    int httpResponseCode = http.POST(jsonPayload);
+
+    if (httpResponseCode > 0) {
+      Serial.printf("HTTP 状态码: %d\n", httpResponseCode);
+      String response = http.getString();
+      Serial.println("服务器返回: " + response);
+    } else {
+      Serial.printf("HTTPS 请求失败，错误: %s\n", http.errorToString(httpResponseCode).c_str());
+    }
+    
+    http.end();
+  } else {
+    Serial.println("无法连接到服务器 URL");
+  }
+}
