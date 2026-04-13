@@ -1,0 +1,230 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <BH1750.h>
+
+// --- 1. 双 OLED 显示屏配置 ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 displayPlant(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);  // 0x3C: 显示植物信息
+Adafruit_SSD1306 displaySensor(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // 0x3D: 显示传感器与硬件状态
+
+// --- 2. 传感器配置 ---
+#define DHTPIN 2       
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+BH1750 lightMeter;     
+
+// --- 3. NMOS 风扇电机配置 (替换原继电器) ---
+const int FAN_PIN = 7;       // NMOS 控制端接 Digital Pin 7 (支持 PWM)
+const int FAN_SPEED = 150;   // PWM 风扇转速值，范围 0-255。150 约为 60% 转速，兼顾降温与静音
+
+// --- 4. HW-269 3W LED 补光配置 ---
+const int LED_PIN = 9; // HW-269 信号控制端接 Digital Pin 9 (支持 PWM)
+const int LED_BRIGHTNESS = 50; // PWM 亮度值，范围 0-255。50 大约是 20% 亮度
+
+// --- 5. NMOS 水泵配置 ---
+const int PUMP_PIN = 6;       // NMOS 控制端接 Digital Pin 6
+
+// --- 6. 系统全局状态变量 ---
+char currentCommand = 'N';           
+unsigned long lastSensorRead = 0;    
+float currentTemp = 0.0;
+float currentHum = 0.0;
+uint16_t currentLux = 0;
+
+// 通讯与水泵定时器变量
+unsigned long lastSerialTime = 0;    // 记录上一次收到串口数据的时间
+unsigned long lastPumpToggleTime = 0;// 记录上一次水泵切换状态的时间
+bool isPumpOn = false;               // 当前水泵状态
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  // 初始化 NMOS (风扇电机)，初始状态使用 PWM 关闭
+  pinMode(FAN_PIN, OUTPUT);
+  analogWrite(FAN_PIN, 0);
+
+  // 初始化 NMOS (水泵)，默认拉低关闭
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW); 
+
+  // 初始化 HW-269 LED
+  pinMode(LED_PIN, OUTPUT);
+  analogWrite(LED_PIN, 0); // 初始状态使用 PWM 关闭补光灯
+
+  // 初始化传感器
+  dht.begin();
+  lightMeter.begin();
+
+  // 初始化双屏
+  if(!displayPlant.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("OLED 0x3C Init Failed"));
+    for(;;); 
+  }
+  if(!displaySensor.begin(SSD1306_SWITCHCAPVCC, 0x3D)) { 
+    Serial.println(F("OLED 0x3D Init Failed"));
+    for(;;); 
+  }
+  
+  // 开机画面
+  displayPlant.clearDisplay(); displayPlant.setTextSize(1); displayPlant.setTextColor(SSD1306_WHITE);
+  displayPlant.setCursor(0, 20); displayPlant.println("AIoT System Ready"); displayPlant.display();
+
+  displaySensor.clearDisplay(); displaySensor.setTextSize(1); displaySensor.setTextColor(SSD1306_WHITE);
+  displaySensor.setCursor(0, 20); displaySensor.println("Sensors Ready"); displaySensor.display();
+  
+  delay(2000);
+}
+
+void loop() {
+  bool needUpdateScreen = false;
+  unsigned long currentMillis = millis();
+
+  // --- 1. 监听串口与超时保护 ---
+  if (Serial.available() > 0) {
+    char incomingChar = Serial.read();
+    if (incomingChar == '0' || incomingChar == '1' || incomingChar == '2' || incomingChar == 'N') {
+      lastSerialTime = currentMillis; 
+      if (incomingChar != currentCommand) {
+        currentCommand = incomingChar;
+        needUpdateScreen = true; 
+      }
+    }
+  }
+
+  if (currentCommand != 'N' && (currentMillis - lastSerialTime > 1500)) {
+    currentCommand = 'N';
+    needUpdateScreen = true;
+  }
+
+  // --- 2. 传感器定时读取 ---
+  if (currentMillis - lastSensorRead > 2000) {
+    currentTemp = dht.readTemperature();
+    currentHum = dht.readHumidity();
+    currentLux = lightMeter.readLightLevel();
+
+    if (isnan(currentTemp)) currentTemp = 0.0;
+    if (isnan(currentHum)) currentHum = 0.0;
+
+    lastSensorRead = currentMillis;
+    needUpdateScreen = true; 
+  }
+
+  // --- 3. 水泵间歇控制逻辑 ---
+  if (currentCommand != 'N') {
+    if (isPumpOn) {
+      if (currentMillis - lastPumpToggleTime >= 2000) { 
+        isPumpOn = false;
+        digitalWrite(PUMP_PIN, LOW); 
+        lastPumpToggleTime = currentMillis;
+        needUpdateScreen = true;
+      }
+    } else {
+      if (currentMillis - lastPumpToggleTime >= 5000) { 
+        isPumpOn = true;
+        digitalWrite(PUMP_PIN, HIGH); 
+        lastPumpToggleTime = currentMillis;
+        needUpdateScreen = true;
+      }
+    }
+  } else {
+    if (isPumpOn) {
+      isPumpOn = false;
+      digitalWrite(PUMP_PIN, LOW);
+      needUpdateScreen = true;
+    }
+    lastPumpToggleTime = currentMillis; 
+  }
+
+  // --- 4. 刷新屏幕与硬件动作 ---
+  if (needUpdateScreen) {
+    updateSystemUI();
+  }
+}
+
+// === UI 绘制与主硬件控制 ===
+void updateSystemUI() {
+  displayPlant.clearDisplay(); displayPlant.setCursor(0, 0);
+  displaySensor.clearDisplay(); displaySensor.setCursor(0, 0);
+
+  float activeMaxTemp = 99.0; 
+  uint16_t activeMinLux = 0;  
+
+  // ==========================================
+  // 屏幕 1 (0x3C): 植物种类
+  // ==========================================
+  displayPlant.setTextSize(2); 
+  
+  if (currentCommand == '0') {
+    displayPlant.println("CACTUS"); displayPlant.setTextSize(1); displayPlant.println("---------------------");
+    displayPlant.println("Temp: 18 - 32 C"); displayPlant.println("Hum : 10 - 30 %"); displayPlant.println("Lux : > 5000 lx");
+    activeMaxTemp = 15.0; activeMinLux = 5000;
+  } 
+  else if (currentCommand == '1') {
+    displayPlant.println("POTHOS"); displayPlant.setTextSize(1); displayPlant.println("---------------------");
+    displayPlant.println("Temp: 15 - 29 C"); displayPlant.println("Hum : 50 - 70 %"); displayPlant.println("Lux : > 1000 lx");
+    activeMaxTemp = 29.0; activeMinLux = 1000;
+  } 
+  else if (currentCommand == '2') {
+    displayPlant.println("SUCCULENT"); displayPlant.setTextSize(1); displayPlant.println("---------------------");
+    displayPlant.println("Temp: 15 - 28 C"); displayPlant.println("Hum : 30 - 50 %"); displayPlant.println("Lux : > 4000 lx");
+    activeMaxTemp = 28.0; activeMinLux = 4000;
+  } 
+  else {
+    displayPlant.println("NO PLANT"); displayPlant.setTextSize(1); displayPlant.println("---------------------");
+    displayPlant.println("Waiting for target...");
+    activeMaxTemp = 99.0; activeMinLux = 0; 
+  }
+
+  // ==========================================
+  // 屏幕 2 (0x3D): 实时环境与外设状态
+  // ==========================================
+  displaySensor.setTextSize(2);
+  displaySensor.println("SYSTEM");
+  displaySensor.setTextSize(1);
+  displaySensor.println("---------------------");
+  
+  // 1. 温度与 NMOS 风扇电机状态 (PWM控制)
+  displaySensor.print("T:"); displaySensor.print(currentTemp, 1); displaySensor.print("C F:");
+  if (currentTemp > activeMaxTemp && currentCommand != 'N') {
+    displaySensor.print("ON("); 
+    displaySensor.print(map(FAN_SPEED, 0, 255, 0, 100)); // 将 PWM 值转换为百分比显示
+    displaySensor.println("%)");
+    analogWrite(FAN_PIN, FAN_SPEED); // 启动风扇并输出 PWM 调速
+  } else {
+    displaySensor.println("OFF"); 
+    analogWrite(FAN_PIN, 0); // 关闭风扇
+  }
+
+  // 2. 湿度与水泵状态 
+  displaySensor.print("H:"); displaySensor.print(currentHum, 1); displaySensor.print("% P:");
+  if (isPumpOn) {
+    displaySensor.println("ON");
+  } else {
+    displaySensor.println("OFF");
+  }
+  
+  // 3. 光照与补光灯状态
+  displaySensor.print("L:"); displaySensor.print(currentLux); displaySensor.print("lx D:");
+  
+  // 使用 PWM 控制亮度和熄灭
+  if (currentLux < activeMinLux && currentCommand != 'N') {
+    displaySensor.print("ON (");
+    // 计算并显示当前的亮度百分比，让 UI 看起来更硬核
+    displaySensor.print(map(LED_BRIGHTNESS, 0, 255, 0, 100)); 
+    displaySensor.println("%)");
+    
+    analogWrite(LED_PIN, LED_BRIGHTNESS); // 开启特定亮度的 HW-269
+  } else {
+    displaySensor.println("OFF");
+    analogWrite(LED_PIN, 0);  // 彻底关闭 HW-269
+  }
+
+  displayPlant.display(); 
+  displaySensor.display(); 
+}
